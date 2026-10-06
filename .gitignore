@@ -3,3 +3,4 @@ __pycache__/
 dataset/
 cau_hinh_bi_mat.py
 models/face_embeddings.pkl
+esp32_khoa_cua/bi_mat.h

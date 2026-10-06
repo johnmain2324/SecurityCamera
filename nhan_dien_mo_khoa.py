@@ -7,12 +7,12 @@ import time
 import warnings
 from collections import deque
 import cv2
-import serial
-import serial.tools.list_ports
+import paho.mqtt.client as mqtt
 import mediapipe as mp
 from flask import Flask, jsonify
 from cau_hinh import (LuongCamera, NGUON_CAMERA, kiem_tra_camera, THOI_GIAN_CHO_BAO_DONG, PHAT_AM_LAPTOP, TI_LE_MAT_GAN,
                       THOI_GIAN_LA_KHACH, THOI_GIAN_BAO_DONG, SO_LAN_SAI_TOI_DA, THOI_GIAN_MAT_DAU,
+                      MQTT_MAY_CHU, MQTT_CONG, CHU_DE_LENH, CHU_DE_SU_KIEN, CHU_DE_TRANG_THAI,
                       CAC_CU_CHI_THU_THACH, DO_DAI_THU_THACH, THOI_GIAN_MOI_BUOC, NGUONG_TIN_CAY_CU_CHI, MAT_KHAU_CU_CHI, CHE_DO_CU_CHI)
 from am_thanh import phat_am, dung_am
 from telegram_bao import gui_bao_dong, gui_co_khach, gui_mo_cua, kiem_tra_token, gui_the_la
@@ -20,7 +20,6 @@ from telegram_bao import gui_bao_dong, gui_co_khach, gui_mo_cua, kiem_tra_token,
 warnings.filterwarnings("ignore", message=".*GetPrototype.*")
 
 CONG_WEB = 5000
-CONG_COM = None
 CU_CHI_MO_KHOA = "so_2"
 NGUONG_COSINE = 0.363
 SO_KHUNG_XAC_NHAN = 10
@@ -56,7 +55,8 @@ thoi_gui_mo = 0
 het_bao_dong = 0
 frame_hien_tai = None
 lan_gui_canh_bao = {}
-dung_doc = threading.Event()
+trang_thai_esp = "?"
+client_mqtt = None
 
 TRANG_WEB = """<!doctype html>
 <html lang="vi">
@@ -182,7 +182,7 @@ def lay_su_kien():
         gan_day = [f"{gio} {noi_dung}" for gio, noi_dung in reversed(lich_su)]
     ten_mau = {(0, 255, 0): "xanh", (0, 255, 255): "vang", (0, 0, 255): "do"}[mau]
     return jsonify({**su_kien, "chu_cua_khoa": chu, "mau_cua_khoa": ten_mau,
-                    "thong_bao_esp": thong_bao, "thong_bao_loi": la_loi, "lich_su": gan_day})
+                    "thong_bao_esp": thong_bao, "esp32": trang_thai_esp, "thong_bao_loi": la_loi, "lich_su": gan_day})
 
 
 def chu_cua_khoa():
@@ -221,29 +221,55 @@ def chuan_hoa(hand_landmarks):
     return [v / m for p in pts for v in p]
 
 
-def ket_noi_esp32():
-    cong = CONG_COM
-    if cong is None:
-        for p in serial.tools.list_ports.comports():
-            if p.vid == 0x303A:
-                cong = p.device
-    if cong is None:
-        print("Khong tim thay ESP32 - chay thu khong co phan cung")
-        return None
+def on_connect(client, userdata, flags, ma_loi, thuoc_tinh):
+    if ma_loi.is_failure:
+        print("Ket noi MQTT loi:", ma_loi)
+        return
+    print("Da ket noi MQTT broker")
+    client.subscribe([(CHU_DE_SU_KIEN, 1), (CHU_DE_TRANG_THAI, 1)])
+
+
+def on_disconnect(client, userdata, co_ngat, ma_loi, thuoc_tinh):
+    print("Mat ket noi MQTT broker - dang thu lai")
+
+
+def on_message(client, userdata, tin):
+    global trang_thai_esp
+    chuoi = tin.payload.decode("utf-8", errors="ignore").strip()
+    if tin.topic == CHU_DE_TRANG_THAI:
+        print("[ESP32]", chuoi)
+        trang_thai_esp = chuoi
+        if chuoi == "OFFLINE":
+            them_su_kien("Mat ket noi khoa cua")
+            if duoc_gui("esp_offline"):
+                gui_mo_cua("Mat ket noi khoa cua")
+        return
+    if not chuoi:
+        return
+    print("[ESP32]", chuoi)
+    if chuoi.startswith("UID:"):
+        return
+    khoa, dau, gia_tri = chuoi.partition(":")
+    if not dau or not khoa or not gia_tri:
+        return
     try:
-        ser = serial.Serial()
-        ser.port = cong
-        ser.baudrate = 115200
-        ser.dtr = True
-        ser.rts = True
-        ser.timeout = 1
-        ser.open()
-        time.sleep(2)
-        print("Da ket noi ESP32 qua", cong)
-        return ser
-    except serial.SerialException:
-        print(f"Khong mo duoc cong {cong} - hay dong Arduino IDE")
-        return None
+        xu_ly_esp32(khoa.strip(), gia_tri.strip())
+    except Exception as e:
+        print("[ESP32] Loi xu ly:", chuoi, "-", e)
+
+
+def ket_noi_mqtt():
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="laptop_ai")
+    client.on_connect = on_connect
+    client.on_disconnect = on_disconnect
+    client.on_message = on_message
+    try:
+        socket.create_connection((MQTT_MAY_CHU, MQTT_CONG), timeout=2).close()
+    except OSError:
+        print("Chua bat Docker EMQX")
+    client.connect_async(MQTT_MAY_CHU, MQTT_CONG, keepalive=15)
+    client.loop_start()
+    return client
 
 
 def them_su_kien(noi_dung):
@@ -251,10 +277,10 @@ def them_su_kien(noi_dung):
         lich_su.append((time.strftime("%H:%M"), noi_dung))
 
 
-def gui_lenh(ser, lenh, ten="", frame_goc=None):
+def gui_lenh(lenh, ten="", frame_goc=None):
     global lan_gui_telegram, thoi_gui_mo
-    if lenh == "O" and not ser:
-        print("Chua ket noi ESP32 - khong mo duoc khoa")
+    if lenh == "O" and not client_mqtt.is_connected():
+        print("Chua ket noi MQTT - khong mo duoc khoa")
         return False
     print("Gui lenh:", lenh)
     if PHAT_AM_LAPTOP:
@@ -267,19 +293,18 @@ def gui_lenh(ser, lenh, ten="", frame_goc=None):
     su_kien["loai"] = "mo_cua" if lenh == "O" else "bao_dong"
     su_kien["noi_dung"] = f"Chao mung {ten}" if lenh == "O" else "CANH BAO NGUOI LA"
     su_kien["id"] += 1
-    if ser:
-        if lenh == "O":
-            with khoa_tt:
-                thoi_gui_mo = time.time()
-        ser.write(lenh.encode())
+    if lenh == "O":
+        with khoa_tt:
+            thoi_gui_mo = time.time()
+    client_mqtt.publish(CHU_DE_LENH, lenh, qos=1)
     return True
 
 
-def bao_dong(ser, frame_goc):
+def bao_dong(frame_goc):
     global lan_bao_dong
     if time.time() - lan_bao_dong < THOI_GIAN_CHO_BAO_DONG:
         return
-    gui_lenh(ser, "X", frame_goc=frame_goc)
+    gui_lenh("X", frame_goc=frame_goc)
     lan_bao_dong = time.time()
 
 
@@ -335,30 +360,6 @@ def xu_ly_esp32(khoa, gia_tri):
         canh_bao_the_la()
     elif khoa == "LOI":
         print(f"[91m[ESP32] LOI: {gia_tri}[0m")
-
-
-def doc_esp32(ser):
-    while not dung_doc.is_set():
-        try:
-            dong = ser.readline().decode("utf-8", errors="ignore").strip()
-        except (serial.SerialException, OSError) as e:
-            if dung_doc.is_set():
-                break
-            print("[ESP32] Loi doc serial:", e)
-            time.sleep(1)
-            continue
-        if not dong:
-            continue
-        print("[ESP32]", dong)
-        if dong.startswith("UID:"):
-            continue
-        khoa, dau, gia_tri = dong.partition(":")
-        if not dau or not khoa or not gia_tri:
-            continue
-        try:
-            xu_ly_esp32(khoa.strip(), gia_tri.strip())
-        except Exception as e:
-            print("[ESP32] Loi xu ly:", dong, "-", e)
 
 
 def viet(frame, chu, dong, mau=(0, 255, 255), co=0.7):
@@ -428,19 +429,15 @@ def main():
         if len(cac_nhan) < 2:
             print(f"Chi co {len(cac_nhan)} cu chi - dung 1 cu chi co dinh {CU_CHI_MO_KHOA}")
 
-    ser = ket_noi_esp32()
-    if ser:
-        threading.Thread(target=doc_esp32, args=(ser,), daemon=True).start()
+    global client_mqtt
+    client_mqtt = ket_noi_mqtt()
     hands = mp.solutions.hands.Hands(max_num_hands=1, min_detection_confidence=0.7, min_tracking_confidence=0.5)
     ve = mp.solutions.drawing_utils
     threading.Thread(target=chay_web, daemon=True).start()
     kiem_tra_token()
     if not kiem_tra_camera():
         print(f"Khong ket noi duoc camera {NGUON_CAMERA} - kiem tra IP Webcam va laptop cung mang wifi")
-        dung_doc.set()
-        if ser:
-            time.sleep(1.2)
-            ser.close()
+        client_mqtt.loop_stop()
         return
     camera = LuongCamera()
 
@@ -525,7 +522,7 @@ def main():
                     da_bao_khach = True
                     gui_co_khach(frame_goc)
                 if dung_la >= THOI_GIAN_BAO_DONG or (bat_dau_tay and bay_gio - bat_dau_tay >= THOI_GIAN_TAY_BAO_DONG):
-                    bao_dong(ser, frame_goc)
+                    bao_dong(frame_goc)
                     bat_dau_tay = 0
 
         elif trang_thai == "CHO_CU_CHI":
@@ -569,7 +566,7 @@ def main():
             viet(frame, f"Con lai: {max(con_lai, 0):.0f}s", 4)
 
             if dem_sai >= SO_KHUNG_NGUOI_LA:
-                bao_dong(ser, frame_goc)
+                bao_dong(frame_goc)
                 trang_thai = "QUET"
                 dem_dung = dem_sai = dem_cu_chi = 0
             elif dem_cu_chi >= SO_KHUNG_CU_CHI:
@@ -581,7 +578,7 @@ def main():
                     print(f"Buoc {buoc} dung")
                 if buoc >= len(thu_thach):
                     dem_lan_sai = 0
-                    if gui_lenh(ser, "O", nguoi):
+                    if gui_lenh("O", nguoi):
                         da_bao_khong_phan_hoi = da_bao_mo = False
                         trang_thai = "DA_MO"
                     else:
@@ -596,7 +593,7 @@ def main():
                 mau_sai = (0, 165, 255)
                 han_thong_bao = bay_gio + THOI_GIAN_HIEN_SAI
                 if dem_lan_sai >= SO_LAN_SAI_TOI_DA:
-                    bao_dong(ser, frame_goc)
+                    bao_dong(frame_goc)
                     dem_lan_sai = 0
                 trang_thai = "QUET"
                 dem_dung = dem_sai = dem_cu_chi = 0
@@ -633,7 +630,7 @@ def main():
             chu_the, mau_the, het_the = thong_bao_the
         if bay_gio < het_the:
             viet(frame, chu_the, 5, mau_the)
-        if not ser:
+        if trang_thai_esp != "ONLINE":
             cv2.putText(frame, "CHUA KET NOI ESP32", (10, cao - 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
         cv2.putText(frame, chu, (10, cao - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, mau, 2)
         cv2.putText(frame, thong_bao, (10, cao - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
@@ -647,16 +644,13 @@ def main():
             dung_am()
             with khoa_tt:
                 het_bao_dong = 0
-            if ser:
-                ser.write(b"S")
-                print("Gui lenh: S")
+            client_mqtt.publish(CHU_DE_LENH, "S", qos=1)
+            print("Gui lenh: S")
 
-    dung_doc.set()
     camera.dung()
     cv2.destroyAllWindows()
-    if ser:
-        time.sleep(1.2)
-        ser.close()
+    client_mqtt.loop_stop()
+    client_mqtt.disconnect()
 
 
 if __name__ == "__main__":

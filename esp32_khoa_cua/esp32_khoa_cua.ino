@@ -1,5 +1,8 @@
 #include <SPI.h>
 #include <MFRC522.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include "bi_mat.h"
 
 const int RELAY_PIN = 3;
 const int LED_PIN = 4;
@@ -27,7 +30,15 @@ const unsigned long THOI_GIAN_CHONG_LAP = 2000;
 const unsigned long THOI_GIAN_DEM_SAI = 30000;
 const int SO_LAN_SAI_TOI_DA = 3;
 
+const char *CHU_DE_LENH = "nha_tin/cua1/lenh";
+const char *CHU_DE_SU_KIEN = "nha_tin/cua1/su_kien";
+const char *CHU_DE_TRANG_THAI = "nha_tin/cua1/trang_thai";
+const unsigned long THOI_GIAN_THU_LAI = 5000;
+
 MFRC522 rfid(SS_PIN, RST_PIN);
+WiFiClient wifiClient;
+PubSubClient mqtt(wifiClient);
+unsigned long lanThuLai = 0;
 
 bool khoaDangMo = false;
 unsigned long mocMoKhoa = 0;
@@ -45,6 +56,7 @@ bool nhay = false;
 
 void guiTrangThai(const char *noiDung) {
   Serial.println(noiDung);
+  if (mqtt.connected()) mqtt.publish(CHU_DE_SU_KIEN, noiDung);
 }
 
 void datLed(bool bat) {
@@ -136,15 +148,36 @@ void xuLyQuetThe(unsigned long bayGio) {
   }
 }
 
-void xuLyLenh() {
-  while (Serial.available()) {
-    char lenh = Serial.read();
-    if (lenh == 'O') moKhoa();
-    else if (lenh == 'X') batBaoDong("CANH_BAO:NGUOI_LA");
-    else if (lenh == 'S') {
-      tatBaoDong();
-      guiTrangThai("THONG_BAO:DA_TAT_BAO_DONG");
-    }
+void xuLyLenh(char lenh) {
+  if (lenh == 'O') moKhoa();
+  else if (lenh == 'X') batBaoDong("CANH_BAO:NGUOI_LA");
+  else if (lenh == 'S') {
+    tatBaoDong();
+    guiTrangThai("THONG_BAO:DA_TAT_BAO_DONG");
+  }
+}
+
+void docSerial() {
+  while (Serial.available()) xuLyLenh(Serial.read());
+}
+
+void nhanMqtt(char *chuDe, byte *noiDung, unsigned int doDai) {
+  if (doDai > 0) xuLyLenh((char)noiDung[0]);
+}
+
+void ketNoiMang(unsigned long bayGio) {
+  if (WiFi.status() == WL_CONNECTED && mqtt.connected()) return;
+  if (bayGio - lanThuLai < THOI_GIAN_THU_LAI) return;
+  lanThuLai = bayGio;
+  if (WiFi.status() != WL_CONNECTED) {
+    WiFi.disconnect();
+    WiFi.begin(WIFI_TEN, WIFI_MAT_KHAU);
+    WiFi.setTxPower(WIFI_POWER_8_5dBm);
+    return;
+  }
+  if (mqtt.connect("esp32_cua1", NULL, NULL, CHU_DE_TRANG_THAI, 0, true, "OFFLINE")) {
+    mqtt.publish(CHU_DE_TRANG_THAI, "ONLINE", true);
+    mqtt.subscribe(CHU_DE_LENH);
   }
 }
 
@@ -199,6 +232,14 @@ void setup() {
   khoiDongRC522();
   delay(500);
 
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_TEN, WIFI_MAT_KHAU);
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);
+  mqtt.setServer(MQTT_MAY_CHU, MQTT_CONG);
+  mqtt.setKeepAlive(15);
+  mqtt.setSocketTimeout(2);
+  mqtt.setCallback(nhanMqtt);
+
   byte phienBan = rfid.PCD_ReadRegister(MFRC522::VersionReg);
   if (phienBan == 0x00 || phienBan == 0xFF) guiTrangThai("LOI:KHONG_THAY_RC522");
 
@@ -208,7 +249,9 @@ void setup() {
 }
 
 void loop() {
-  xuLyLenh();
+  docSerial();
+  ketNoiMang(millis());
+  mqtt.loop();
   kiemTraRC522(millis());
   xuLyQuetThe(millis());
   capNhatKhoa(millis());

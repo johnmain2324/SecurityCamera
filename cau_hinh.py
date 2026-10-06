@@ -3,7 +3,7 @@ import time
 import cv2
 from cau_hinh_bi_mat import TOKEN_BAO_DONG, TOKEN_CHUONG, CHAT_ID
 
-NGUON_CAMERA = "http://192.168.1.3:8080/video"
+NGUON_CAMERA = "http://172.20.10.10:8080/video"
 THOI_GIAN_MO_CAMERA = 8
 LAT_ANH = False
 XOAY_ANH = None
@@ -79,3 +79,10 @@ class LuongCamera:
 
     def dung(self):
         self.chay = False
+
+
+MQTT_MAY_CHU = "localhost"
+MQTT_CONG = 1883
+CHU_DE_LENH = "nha_tin/cua1/lenh"
+CHU_DE_SU_KIEN = "nha_tin/cua1/su_kien"
+CHU_DE_TRANG_THAI = "nha_tin/cua1/trang_thai"
