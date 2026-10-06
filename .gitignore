@@ -1,0 +1,5 @@
+__pycache__/
+.vscode/
+dataset/
+cau_hinh_bi_mat.py
+models/face_embeddings.pkl
